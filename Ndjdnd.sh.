@@ -1,0 +1,404 @@
+
+#!/bin/bash
+set -e
+
+mkdir -p client/src server
+
+cat > package.json <<'EOF'
+{
+  "name": "together-cinema",
+  "private": true,
+  "workspaces": ["client", "server"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace server\" \"npm run dev --workspace client\"",
+    "build": "npm run build --workspace client",
+    "start": "npm run start --workspace server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
+EOF
+
+cat > client/package.json <<'EOF'
+{
+  "name": "client",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "socket.io-client": "^4.8.1"
+  }
+}
+EOF
+
+cat > client/index.html <<'EOF'
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Together Cinema ❤️</title>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.jsx"></script>
+</body>
+</html>
+EOF
+
+cat > client/vite.config.js <<'EOF'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    host: "0.0.0.0",
+    proxy: {
+      "/api": "http://localhost:3001",
+      "/socket.io": {
+        target: "http://localhost:3001",
+        ws: true
+      }
+    }
+  }
+});
+EOF
+
+cat > client/src/main.jsx <<'EOF'
+import React, { useEffect, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { io } from "socket.io-client";
+import "./style.css";
+
+const API = import.meta.env.VITE_API_URL || "";
+const tg = window.Telegram?.WebApp;
+const initData = tg?.initData || "";
+tg?.ready?.();
+tg?.expand?.();
+
+function App() {
+  const [name, setName] = useState(tg?.initDataUnsafe?.user?.first_name || "Гость");
+  const [roomId, setRoomId] = useState(new URLSearchParams(location.search).get("room") || "");
+  const [room, setRoom] = useState(null);
+  const [socket, setSocket] = useState(null);
+  const [message, setMessage] = useState("");
+  const [video, setVideo] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const s = io(API || undefined, { auth: { initData } });
+    setSocket(s);
+    s.on("room:update", setRoom);
+    s.on("room:error", setError);
+    s.on("connect_error", e => setError(e.message));
+    return () => s.disconnect();
+  }, []);
+
+  async function createRoom() {
+    try {
+      const r = await fetch(`${API}/api/rooms`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-telegram-init-data": initData
+        },
+        body: JSON.stringify({ name })
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || "Ошибка");
+      setRoomId(data.room.id);
+      history.replaceState({}, "", `?room=${data.room.id}`);
+      socket?.emit("room:join", { roomId: data.room.id });
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  function joinRoom() {
+    socket?.emit("room:join", { roomId: roomId.trim().toUpperCase() });
+  }
+
+  function sendMessage(e) {
+    e.preventDefault();
+    if (!message.trim()) return;
+    socket.emit("chat:message", { roomId, text: message.trim() });
+    setMessage("");
+  }
+
+  function setVideoUrl(e) {
+    e.preventDefault();
+    if (!video.trim()) return;
+    socket.emit("video:set", { roomId, url: video.trim() });
+    setVideo("");
+  }
+
+  function invite() {
+    navigator.clipboard?.writeText(
+      `${location.origin}${location.pathname}?room=${roomId}`
+    );
+  }
+
+  const videoId = room?.videoUrl
+    ? (() => {
+        try {
+          const u = new URL(room.videoUrl);
+          return u.hostname.includes("youtu.be")
+            ? u.pathname.slice(1)
+            : u.searchParams.get("v");
+        } catch {
+          return "";
+        }
+      })()
+    : "";
+
+  return (
+    <main>
+      <header>
+        <div className="logo">🍿</div>
+        <div>
+          <h1>Together Cinema</h1>
+          <p>Ваш маленький кинозал на двоих ❤️</p>
+        </div>
+      </header>
+
+      {!room ? (
+        <section className="panel">
+          <h2>Смотрим вместе?</h2>
+          <p>Создай комнату или введи код приглашения.</p>
+          <label>Твоё имя</label>
+          <input value={name} onChange={e => setName(e.target.value)} />
+          <button onClick={createRoom}>Создать комнату ❤️</button>
+          <div className="or">или присоединиться</div>
+          <label>Код комнаты</label>
+          <input
+            value={roomId}
+            onChange={e => setRoomId(e.target.value.toUpperCase())}
+            placeholder="Например, A1B2C3"
+          />
+          <button className="secondary" onClick={joinRoom}>
+            Войти в комнату
+          </button>
+        </section>
+      ) : (
+        <section className="panel">
+          <h2>Комната {room.id}</h2>
+          <button className="secondary" onClick={invite}>
+            Скопировать приглашение
+          </button>
+          <p>Участники: {(room.members || []).map(x => x.name).join(", ")}</p>
+          <form onSubmit={setVideoUrl}>
+            <label>Ссылка на YouTube</label>
+            <input
+              value={video}
+              onChange={e => setVideo(e.target.value)}
+              placeholder="https://youtube.com/watch?v=..."
+            />
+            <button>Установить видео</button>
+          </form>
+          {videoId && (
+            <div className="video">
+              <iframe
+                src={`https://www.youtube-nocookie.com/embed/${videoId}`}
+                title="Видео"
+                allowFullScreen
+              />
+            </div>
+          )}
+          <h3>Общий чат 💬</h3>
+          <div className="messages">
+            {(room.messages || []).map((m, i) => (
+              <p key={i}><b>{m.name}:</b> {m.text}</p>
+            ))}
+          </div>
+          <form onSubmit={sendMessage} className="chat">
+            <input
+              value={message}
+              onChange={e => setMessage(e.target.value)}
+              placeholder="Напиши что-нибудь нежное…"
+            />
+            <button>➤</button>
+          </form>
+        </section>
+      )}
+      {error && <p className="error">{error}</p>}
+      <footer>Сделано для уютных вечеров ✨</footer>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")).render(<App />);
+EOF
+
+cat > client/src/style.css <<'EOF'
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at top, #48254d, #171321 70%);
+  color: white;
+  font-family: system-ui, sans-serif;
+}
+main { max-width: 620px; margin: auto; padding: 28px 18px; }
+header { display: flex; align-items: center; gap: 14px; margin: 20px 0 28px; }
+.logo { font-size: 36px; background: #ffffff18; padding: 12px; border-radius: 18px; }
+h1 { font-size: 25px; margin: 0; }
+header p, footer { color: #c5b8ca; }
+.panel { background: #ffffff12; border: 1px solid #ffffff25; border-radius: 24px; padding: 22px; }
+label { display: block; margin: 16px 0 7px; color: #e0d1e5; }
+input {
+  width: 100%; padding: 14px; border-radius: 13px;
+  border: 1px solid #ffffff30; background: #211a2b;
+  color: white; font-size: 16px;
+}
+button {
+  width: 100%; padding: 14px; margin-top: 13px;
+  border: 0; border-radius: 13px; background: #ed6b9a;
+  color: #241421; font-weight: bold; font-size: 15px;
+}
+.secondary { background: #ffffff20; color: white; }
+.or { text-align: center; margin: 18px; color: #c5b8ca; }
+.video { position: relative; padding-bottom: 56.25%; margin-top: 16px; }
+.video iframe { position: absolute; width: 100%; height: 100%; border: 0; border-radius: 14px; }
+.messages { background: #211a2b; border-radius: 12px; padding: 12px; overflow-wrap: anywhere; }
+.chat { display: flex; gap: 8px; }
+.chat input { flex: 1; min-width: 0; }
+.chat button { width: 55px; }
+.error { color: #ff9cbb; }
+footer { text-align: center; padding: 24px; font-size: 12px; }
+EOF
+
+cat > server/package.json <<'EOF'
+{
+  "name": "server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  }
+}
+EOF
+
+cat > server/.env.example <<'EOF'
+PORT=3001
+BOT_TOKEN=add_your_bot_token_in_private_environment_settings
+CLIENT_ORIGIN=http://localhost:5173
+EOF
+
+cat > server/index.js <<'EOF'
+import express from "express";
+import http from "http";
+import cors from "cors";
+import dotenv from "dotenv";
+import crypto from "crypto";
+import { Server } from "socket.io";
+
+dotenv.config();
+const app = express();
+const server = http.createServer(app);
+const allowed = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+  .split(",").map(x => x.trim());
+
+app.use(cors({ origin: allowed }));
+app.use(express.json());
+
+function telegramUser(initData) {
+  if (!process.env.BOT_TOKEN) return { id: "demo", first_name: "Гость" };
+  if (!initData) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+  params.delete("hash");
+  const check = [...params.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`).join("\n");
+  const secret = crypto.createHmac("sha256", "WebAppData")
+    .update(process.env.BOT_TOKEN).digest();
+  const expected = crypto.createHmac("sha256", secret)
+    .update(check).digest("hex");
+  if (!hash || hash.length !== expected.length ||
+      !crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected))) return null;
+  try { return JSON.parse(params.get("user") || "{}"); }
+  catch { return null; }
+}
+
+const rooms = new Map();
+
+app.get("/api/health", (_, res) => res.json({ ok: true }));
+
+app.post("/api/rooms", (req, res) => {
+  const user = telegramUser(req.get("x-telegram-init-data"));
+  if (!user) return res.status(401).json({ error: "Открой приложение через Telegram" });
+  const id = crypto.randomBytes(3).toString("hex").toUpperCase();
+  const room = {
+    id,
+    members: [{ id: String(user.id), name: req.body.name || user.first_name || "Гость" }],
+    messages: [],
+    videoUrl: ""
+  };
+  rooms.set(id, room);
+  res.json({ room });
+});
+
+const io = new Server(server, { cors: { origin: allowed } });
+io.use((socket, next) => {
+  const user = telegramUser(socket.handshake.auth?.initData);
+  if (!user) return next(new Error("Открой приложение через Telegram"));
+  socket.user = user;
+  next();
+});
+
+io.on("connection", socket => {
+  socket.on("room:join", ({ roomId }) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room) return socket.emit("room:error", "Комната не найдена");
+    socket.join(room.id);
+    const member = {
+      id: String(socket.user.id),
+      name: socket.user.first_name || "Гость"
+    };
+    if (!room.members.some(x => x.id === member.id)) room.members.push(member);
+    socket.data.roomId = room.id;
+    io.to(room.id).emit("room:update", room);
+  });
+
+  socket.on("chat:message", ({ roomId, text }) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room || socket.data.roomId !== room.id || typeof text !== "string") return;
+    room.messages.push({
+      name: socket.user.first_name || "Гость",
+      text: text.slice(0, 500)
+    });
+    room.messages = room.messages.slice(-100);
+    io.to(room.id).emit("room:update", room);
+  });
+
+  socket.on("video:set", ({ roomId, url }) => {
+    const room = rooms.get(String(roomId || "").toUpperCase());
+    if (!room || socket.data.roomId !== room.id || typeof url !== "string") return;
+    if (!/^https:\/\/(www\.)?(youtube\.com|youtu\.be)\//.test(url)) return;
+    room.videoUrl = url;
+    io.to(room.id).emit("room:update", room);
+  });
+});
+
+const port = process.env.PORT || 3001;
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Together Cinema listening on ${port}`);
+});
+EOF
+
+echo "Together Cinema project files created!"
